@@ -108,7 +108,7 @@ class MySql::Connection < DB::Connection
 
       handshake = read_packet(Protocol::HandshakeV10)
 
-      handshake_response = Protocol::HandshakeResponse41.new(mysql_options.username, mysql_options.password, mysql_options.initial_catalog, handshake.auth_plugin_data, charset_id)
+      handshake_response = Protocol::HandshakeResponse41.new(mysql_options.username, mysql_options.password, mysql_options.initial_catalog, handshake.auth_plugin_data, charset_id, handshake.auth_plugin_name)
       seq = 1
 
       if mysql_options.ssl_options.mode != SSLMode::Disabled &&
@@ -129,11 +129,69 @@ class MySql::Connection < DB::Connection
         handshake_response.write(packet)
       end
 
-      read_ok_or_err do |packet, status|
-        raise "packet #{status} not implemented"
-      end
+      authenticate(mysql_options)
     rescue IO::Error
       raise DB::ConnectionRefused.new
+    end
+  end
+
+  # Handles whatever the server sends back after the initial handshake
+  # response: an OK packet ends this (auth succeeded); an AuthSwitchRequest
+  # (status 0xFE) means the account needs a different plugin than the one
+  # we guessed, so recompute and resend using its own nonce; AuthMoreData
+  # (status 0x01) is caching_sha2_password's own sub-protocol - 0x03 means
+  # the fast-path challenge-response already succeeded and the real OK is
+  # the very next packet, 0x04 means "full authentication required" (the
+  # server hasn't cached this account's auth info yet), answered by
+  # sending the plaintext password once the channel is already secure
+  # (TLS or a unix socket - both are already encrypted/local, so a
+  # plaintext password over them is the documented, correct MySQL
+  # protocol response, not a shortcut); a plain, non-secured TCP
+  # connection has no way to answer 0x04 without an RSA public-key
+  # exchange this driver doesn't implement, so it raises a clear message
+  # instead of silently failing deep in a hard-to-debug spot.
+  private def authenticate(mysql_options : ::MySql::Connection::Options)
+    loop do
+      responded = false
+
+      read_ok_or_err do |packet, status|
+        responded = true
+        reply_seq = packet.seq.to_i32 + 1
+
+        case status
+        when 0xFE
+          switch = Protocol::AuthSwitchRequest.read(packet)
+          response = mysql_options.password.try { |pw| Protocol::Auth.scramble(switch.plugin_name, pw, switch.auth_plugin_data) } || Bytes.new(0)
+
+          write_packet(reply_seq) { |p| p.write(response) }
+        when 0x01
+          sub_status = packet.read_byte!
+
+          case sub_status
+          when 0x03
+            # fast_auth success - the server's real OK/ERR follows as the
+            # very next packet, nothing to send back.
+          when 0x04
+            secure = @socket.is_a?(OpenSSL::SSL::Socket::Client) || mysql_options.transport.scheme == "unix"
+            unless secure
+              raise "caching_sha2_password full authentication requires a secure connection " \
+                    "(ssl-mode other than disabled, or a unix socket) - full authentication over " \
+                    "plain TCP needs an RSA public-key exchange this driver doesn't implement"
+            end
+
+            write_packet(reply_seq) do |p|
+              p << (mysql_options.password || "")
+              p.write_byte 0_u8
+            end
+          else
+            raise "unexpected caching_sha2_password AuthMoreData status #{sub_status}"
+          end
+        else
+          raise "packet #{status} not implemented"
+        end
+      end
+
+      break unless responded
     end
   end
 

@@ -3,6 +3,14 @@ class MySql::ReadPacket < IO
   @remaining : Int32 = 0
   @seq : UInt8 = 0u8
 
+  # The sequence number this packet was actually sent with - a reply to
+  # it must use seq + 1, whatever the connection's own local bookkeeping
+  # currently expects (sequence numbers increment per packet regardless
+  # of which side sent it, so a multi-packet auth exchange like
+  # AuthSwitchRequest/AuthMoreData can't just keep incrementing a local
+  # counter without also accounting for the packets it received).
+  getter seq
+
   def initialize(@io : IO, @connection : Connection)
     @length = 0
     @remaining = 0
