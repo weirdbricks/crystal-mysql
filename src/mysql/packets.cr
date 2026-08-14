@@ -68,6 +68,14 @@ module MySql::Protocol
       case plugin_name
       when "caching_sha2_password"
         scramble_sha256(password, nonce)
+      when "auth_socket", "unix_socket", "mysql_clear_password"
+        # These plugins don't use password-based challenge-response.
+        # auth_socket/unix_socket verify peer credentials (SO_PEERCRED
+        # on Unix sockets) instead of a password hash. mysql_clear_password
+        # sends the plaintext password itself (only over TLS).
+        # An empty response tells the server to proceed with its own
+        # non-password verification logic.
+        Bytes.new(0)
       else
         # mysql_native_password, and the default when the server doesn't
         # declare a plugin at all (pre-4.1-style servers this driver
@@ -157,7 +165,7 @@ module MySql::Protocol
     # fixed by declaring the identical capability set in both packets.
     private def capabilities : Int32
       caps = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
-      caps |= CLIENT_PLUGIN_AUTH if @password
+      caps |= CLIENT_PLUGIN_AUTH
       caps |= CLIENT_CONNECT_WITH_DB if @initial_catalog
       caps
     end
@@ -200,6 +208,14 @@ module MySql::Protocol
       end
 
       if @password
+        packet << (@auth_plugin_name || "mysql_native_password")
+        packet.write_byte 0_u8
+      elsif @username
+        # When no password is given but the server still expects a plugin
+        # name (CLIENT_PLUGIN_AUTH is now advertised unconditionally),
+        # send the server's declared plugin name so it knows what the
+        # client expects. This is load-bearing for auth_socket/unix_socket
+        # accounts: the server uses it to decide the auth flow.
         packet << (@auth_plugin_name || "mysql_native_password")
         packet.write_byte 0_u8
       end
