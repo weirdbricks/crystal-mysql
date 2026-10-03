@@ -89,6 +89,9 @@ class MySql::Connection < DB::Connection
   def initialize(options : ::DB::Connection::Options, mysql_options : ::MySql::Connection::Options)
     super(options)
     @socket = uninitialized UNIXSocket | TCPSocket | OpenSSL::SSL::Socket::Client
+    # The handshake's auth nonce, kept for caching_sha2_password full
+    # authentication (the scramble of the password is keyed with it).
+    @auth_nonce = Bytes.empty
 
     begin
       charset_id = Collations.id_for_collation(mysql_options.charset).to_u8
@@ -107,6 +110,7 @@ class MySql::Connection < DB::Connection
         end
 
       handshake = read_packet(Protocol::HandshakeV10)
+      @auth_nonce = handshake.auth_plugin_data
 
       handshake_response = Protocol::HandshakeResponse41.new(mysql_options.username, mysql_options.password, mysql_options.initial_catalog, handshake.auth_plugin_data, charset_id, handshake.auth_plugin_name)
       seq = 1
@@ -147,9 +151,9 @@ class MySql::Connection < DB::Connection
   # (TLS or a unix socket - both are already encrypted/local, so a
   # plaintext password over them is the documented, correct MySQL
   # protocol response, not a shortcut); a plain, non-secured TCP
-  # connection has no way to answer 0x04 without an RSA public-key
-  # exchange this driver doesn't implement, so it raises a clear message
-  # instead of silently failing deep in a hard-to-debug spot.
+  # connection instead asks the server for its public key and answers with
+  # the password RSA-OAEP-encrypted against it, exactly like PyMySQL and
+  # mysql2 do, so only ciphertext ever crosses the wire.
   private def authenticate(mysql_options : ::MySql::Connection::Options)
     loop do
       responded = false
@@ -161,6 +165,7 @@ class MySql::Connection < DB::Connection
         case status
         when 0xFE
           switch = Protocol::AuthSwitchRequest.read(packet)
+          @auth_nonce = switch.auth_plugin_data
           response = mysql_options.password.try { |pw| Protocol::Auth.scramble(switch.plugin_name, pw, switch.auth_plugin_data) } || Bytes.new(0)
 
           write_packet(reply_seq) { |p| p.write(response) }
@@ -173,15 +178,33 @@ class MySql::Connection < DB::Connection
             # very next packet, nothing to send back.
           when 0x04
             secure = @socket.is_a?(OpenSSL::SSL::Socket::Client) || mysql_options.transport.scheme == "unix"
-            unless secure
-              raise "caching_sha2_password full authentication requires a secure connection " \
-                    "(ssl-mode other than disabled, or a unix socket) - full authentication over " \
-                    "plain TCP needs an RSA public-key exchange this driver doesn't implement"
-            end
 
-            write_packet(reply_seq) do |p|
-              p << (mysql_options.password || "")
-              p.write_byte 0_u8
+            if secure
+              write_packet(reply_seq) do |p|
+                p << (mysql_options.password || "")
+                p.write_byte 0_u8
+              end
+            else
+              # No secure channel: ask the server for its public key (0x02),
+              # then answer with the password RSA-OAEP-encrypted against it -
+              # the same exchange PyMySQL/mysql2 do. Only the ciphertext (and
+              # the server's own public key) ever crosses the wire.
+              write_packet(reply_seq) { |p| p.write_byte 0x02_u8 }
+
+              key_seq = 0
+              pem = nil.as(String?)
+              read_ok_or_err do |key_packet, key_status|
+                key_seq = key_packet.seq.to_i32 + 1
+                unless key_status == 0x01
+                  raise "unexpected packet #{key_status} while requesting the server public key"
+                end
+                buffer = Bytes.new(key_packet.remaining_bytes)
+                key_packet.read(buffer)
+                pem = String.new(buffer)
+              end
+              raise "the server did not send a public key" unless pem
+
+              write_packet(key_seq) { |p| p.write(Protocol::Auth.encrypt_password(mysql_options.password, @auth_nonce, pem.not_nil!)) }
             end
           else
             raise "unexpected caching_sha2_password AuthMoreData status #{sub_status}"

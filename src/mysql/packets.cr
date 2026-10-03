@@ -110,6 +110,20 @@ module MySql::Protocol
       xor(p1, p3)
     end
 
+    # caching_sha2_password full authentication over an unencrypted
+    # channel: the NUL-terminated password is XOR-ed with the repeating auth
+    # nonce and RSA-OAEP encrypted with the server's public key - exactly
+    # PyMySQL's sha2_rsa_encrypt (NUL terminator included), so only the
+    # server's own public key and ciphertext ever cross an unencrypted wire.
+    def self.encrypt_password(password : String?, nonce : Bytes, pem : Bytes | String) : Bytes
+      scrambled = Bytes.new(password.to_s.bytesize + 1) do |i|
+        byte = i == password.to_s.bytesize ? 0_u8 : password.to_s.byte_at(i).to_u8
+        byte ^ nonce[i % nonce.size]
+      end
+
+      RsaOaep.encrypt(pem, scrambled)
+    end
+
     def self.sha256(data : Bytes) : Bytes
       digest = OpenSSL::Digest.new("SHA256")
       digest.update(data)

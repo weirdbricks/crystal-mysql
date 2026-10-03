@@ -52,6 +52,14 @@ class MySql::ReadPacket < IO
     read_byte || raise "Unexpected EOF"
   end
 
+  # :nodoc:
+  # Bytes of this packet's payload not consumed yet - the public-key
+  # AuthMoreData payload caching_sha2_password sends, whose length only the
+  # packet header knows.
+  def remaining_bytes
+    @remaining
+  end
+
   def read_string
     String.build do |buffer|
       while (b = read_byte) != 0 && b
