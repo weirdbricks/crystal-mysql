@@ -4,6 +4,10 @@ require "openssl"
 class MySql::Connection < DB::Connection
   class PacketError < Exception; end
 
+  def driver_name : String
+    "mysql"
+  end
+
   enum SSLMode
     Disabled
     Preferred
